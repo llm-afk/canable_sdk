@@ -66,8 +66,31 @@ def _check(ok):
         raise C.WinError(C.get_last_error())
 
 
+class _ThreadPriority:
+    """Owner-thread boost. Must restore on the same owning thread."""
+    def __init__(self):
+        if os.name != "nt":
+            raise OSError("Thread priority mode requires Windows")
+        self.k = C.WinDLL("kernel32", use_last_error=True)
+        _bind(self.k, "GetCurrentThread", [], W.HANDLE)
+        _bind(self.k, "GetThreadPriority", [W.HANDLE], C.c_int)
+        _bind(self.k, "SetThreadPriority", [W.HANDLE, C.c_int])
+        self.thread = self.k.GetCurrentThread()  # Pseudo handle: do not close.
+        self.original = self.k.GetThreadPriority(self.thread)
+        if self.original == 0x7FFFFFFF:
+            raise C.WinError(C.get_last_error())
+        _check(self.k.SetThreadPriority(self.thread, max(self.original, 2)))
+
+    def restore(self):
+        _check(self.k.SetThreadPriority(self.thread, self.original))
+
+
 class _Usb:
-    def __init__(self, path):
+    def __init__(self, path, *, low_latency=True, raw_io=False):
+        # CPU/latency tradeoff, scoped to this connection. No global
+        # timer resolution, process priority or send completion semantics change.
+        self._read_spin = .002 if low_latency else .0006
+        self._write_spin = .002 if low_latency else .001
         if os.name != "nt":
             raise OSError("Canable backend requires Windows + WinUSB")
         self.k = C.WinDLL("kernel32", use_last_error=True)
@@ -84,6 +107,8 @@ class _Usb:
         _bind(self.w, "WinUsb_ControlTransfer", [h, Setup, p, u, C.POINTER(u), p])
         _bind(self.w, "WinUsb_QueryPipe", [h, C.c_uint8, C.c_uint8, C.POINTER(PipeInfo)])
         _bind(self.w, "WinUsb_SetPipePolicy", [h, C.c_uint8, u, u, p])
+        _bind(self.w, "WinUsb_GetPipePolicy", [h, C.c_uint8, u, C.POINTER(u), p])
+        _bind(self.w, "WinUsb_QueryDeviceInformation", [h, u, C.POINTER(u), p])
         _bind(self.w, "WinUsb_GetOverlappedResult", [h, C.POINTER(Overlapped), C.POINTER(u), W.BOOL])
         for name in ("WinUsb_ReadPipe", "WinUsb_WritePipe"):
             _bind(self.w, name, [h, C.c_uint8, p, u, C.POINTER(u), p])
@@ -110,6 +135,26 @@ class _Usb:
                 raise OSError("expected one bulk IN and one bulk OUT endpoint")
             self.input, self.output = inputs[0].pipe_id, outputs[0].pipe_id
             self.read_size = max(1024, inputs[0].packet_size * 2)
+            self.read_size = math.ceil(self.read_size / inputs[0].packet_size) * inputs[0].packet_size
+            maximum, length = u(), u(4)
+            _check(self.w.WinUsb_GetPipePolicy(self.usb, self.input, 8, C.byref(length), C.byref(maximum)))
+            if self.read_size > maximum.value:
+                raise OSError("USB read buffer exceeds MAXIMUM_TRANSFER_SIZE")
+            # RAW_IO applies to IN only. Each buffer is packet-aligned; keep
+            # short-packet termination and ordered completion/requeue intact.
+            enabled = C.c_ubyte(bool(raw_io))
+            _check(self.w.WinUsb_SetPipePolicy(self.usb, self.input, 7, 1, C.byref(enabled)))
+            actual, length = C.c_ubyte(), u(1)
+            _check(self.w.WinUsb_GetPipePolicy(self.usb, self.input, 7, C.byref(length), C.byref(actual)))
+            if bool(actual.value) != bool(raw_io):
+                raise OSError("RAW_IO policy readback mismatch")
+            speed, length = C.c_ubyte(), u(1)
+            _check(self.w.WinUsb_QueryDeviceInformation(self.usb, 1, C.byref(length), C.byref(speed)))
+            self.io_info = dict(speed={1: "full-speed-or-lower", 3: "high-speed-or-higher"}.get(speed.value, "unknown"),
+                                speed_code=speed.value,
+                                in_packet=inputs[0].packet_size, out_packet=outputs[0].packet_size,
+                                read_size=self.read_size, read_queue=8, raw_io=bool(actual.value),
+                                maximum_transfer=maximum.value)
             # Keep USB IN requests queued while Python is descheduled or writing.
             # The queue is bounded and consumed in submission order.
             for _ in range(8):
@@ -189,8 +234,9 @@ class _Usb:
                 if remaining <= 0:
                     raise TimeoutError("USB write timed out; CAN transmission outcome uncertain")
                 # Poll the usual sub-ms completion without a Windows wait wakeup.
-                # Long exceptional waits sleep; the first millisecond stays awake.
-                if time.perf_counter() - started > .001:
+                # Long exceptional waits sleep; low_latency extends the initial
+                # polling window from 1 ms to 2 ms.
+                if time.perf_counter() - started > self._write_spin:
                     time.sleep(min(remaining, .001))
         finally:
             self._cancel_write()
@@ -214,7 +260,7 @@ class _Usb:
                 ok = self.w.WinUsb_GetOverlappedResult(self.usb, C.byref(slot.overlapped), C.byref(n), False)
                 slot.pending = False
                 _check(ok)
-                data = slot.buffer.raw[:n.value]
+                data = C.string_at(slot.buffer, n.value)
                 self._submit_read(slot)  # Requeue at the USB tail before decoding.
                 self._read_head = (self._read_head + 1) % len(self._reads)
                 return data
@@ -225,10 +271,10 @@ class _Usb:
                 return None
             # A 100 us Python sleep measured ~0.54 ms on the target Windows
             # host, and can overshoot the next TX deadline. Keep the final
-            # 600 us awake, polling the overlapped event (ctypes releases GIL).
-            # Longer waits still sleep, so idle/SDO waits do not busy-spin.
-            if remaining > 0.0006:
-                time.sleep(min(remaining - 0.0006, 0.001))
+            # 600 us awake (2 ms with low_latency), polling the overlapped event
+            # (ctypes releases GIL). Longer waits still sleep.
+            if remaining > self._read_spin:
+                time.sleep(min(remaining - self._read_spin, 0.001))
 
     def _issue_read(self):
         # After suspend all slots are idle; during normal I/O all are pending.
@@ -357,13 +403,15 @@ ConvertTo-Json -InputObject $items -Compress
             raise OSError(f"USB discovery failed: {result.stderr.strip()}")
         return json.loads(result.stdout)
 
-    def __init__(self, serial_number=None, *, filter_reports=False):
+    def __init__(self, serial_number=None, *, filter_reports=False, low_latency=True, raw_io=False):
         """只保存连接参数，不打开 USB。
 
         上层应用应传入指定 SN；None 仅在恰好一只适配器时可用。
         显式 SN 未匹配时直接报错，不回退到其他适配器。
         """
         self.serial_number = serial_number
+        self.low_latency = bool(low_latency)
+        self.raw_io = bool(raw_io)
         self.filter_reports = filter_reports
         self._fd = True
         self.counter_reports = 0
@@ -383,7 +431,7 @@ ConvertTo-Json -InputObject $items -Compress
         if len(devices) != 1:
             serials = ', '.join(d['serial_number'] for d in available) or '(none)'
             raise OSError(f"matched {len(devices)} CANable devices; connected serials: {serials}; specify --serial when multiple adapters are connected")
-        return _Usb(devices[0]["path"])
+        return _Usb(devices[0]["path"], low_latency=self.low_latency, raw_io=self.raw_io)
 
     @staticmethod
     def _info(usb):
@@ -417,6 +465,7 @@ ConvertTo-Json -InputObject $items -Compress
         self._usb = self._connect()
         try:
             self.info = self._info(self._usb)
+            self.info["usb_io"] = self._usb.io_info.copy()
             if (self.info["channels"] != 1 or self.info["firmware"] not in SUPPORTED_FIRMWARE
                     or int(self.info["features"], 16) & 0x4500 != 0x4500):
                 raise OSError(f"unsupported CANable capabilities/firmware: {self.info}; "
