@@ -73,9 +73,7 @@ def diagnostics():
     with _lock:
         bus = _connection()
         return dict(info=dict(bus.info), counter_reports=bus.counter_reports,
-                    protocol_reports=bus.protocol_reports,
-                    last_counter_report=dict(bus.last_counter_report) if bus.last_counter_report else None,
-                    last_protocol_report=dict(bus.last_protocol_report) if bus.last_protocol_report else None)
+                    last_counter_report=dict(bus.last_counter_report) if bus.last_counter_report else None)
 
 def close():
     """Stop CAN and release USB; safe to repeat. Does not disable a motor."""

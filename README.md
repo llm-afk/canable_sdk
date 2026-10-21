@@ -1,66 +1,75 @@
 # canable_sdk
 
-Python 核心接口，Windows + WinUSB，Python 3.11+，仅依赖标准库。
-将 `canable` 文件夹复制到你的 Python 主程序旁，即可直接使用，无需安装。
+Windows + WinUSB，Python 3.11+。支持已验证的单通道 Candlelight 2.5，USB 1D50:606F / MI_00，固件0x260618、0x260803、0x261001；不支持SLCAN。SDK只处理CAN帧和适配器，不含电机协议。
+
+## 使用：复制目录，无需安装
+
+把`canable`文件夹放在主程序旁，直接导入。SDK不依赖pip包。`native/`是可选高频引擎源码；Python接口使用附带的Windows x64 `canable/_native.dll`。
 
 ```python
 import canable
 
-canable.open(bitrate=1_000_000)
+canable.open(serial_number="20923378374350012", fd=True,
+             bitrate=1_000_000, data_bitrate=4_000_000)
 try:
-    canable.send(0x123, b'\x01\x02')
+    canable.send(0x123, b"\x01\x02")
     frame = canable.recv(timeout=0.1)
     if frame is not None:
-        print(hex(frame.can_id), frame.data.hex(), frame.is_error)
+        print(frame.can_id, frame.data, frame.is_error)
 finally:
     canable.close()
 ```
 
-- `canable.detect()`：枚举设备；`canable.inspect()`：读取设备信息，均不启动 CAN。
-- 多个设备时，使用 `canable.open(serial_number="设备序列号", ...)`。
-- CAN FD：`canable.open(fd=True, bitrate=1_000_000, data_bitrate=4_000_000)`；发送默认启用 BRS，可传 `brs=False`。
-- 默认启用 `low_latency=True`：接收等待最后 2 ms 持续轮询 USB 事件，发送完成等待前 2 ms 持续轮询，减少短 sleep 唤醒越过发送时刻的问题。可传 False 恢复原等待策略；低延迟模式会增加 CPU 占用，不保证硬实时，也不改变 `send()` 等待 USB 完成的含义。
-- 默认启用 `high_priority=True`：将调用 `open()` 的线程提升至 Windows `THREAD_PRIORITY_HIGHEST`（原优先级更高时保留），同线程调用 `close()` 时恢复；其他线程和进程优先级不变。可传 False 关闭。即使 USB 关闭报错也会尝试恢复；启用失败会关闭刚打开的 USB 连接。该选项可减少普通线程竞争导致的延迟，不能消除驱动/中断/系统调度抖动。
-- 扩展帧：`canable.send(0x123456, b'\x01', is_extended=True)`。
-- `diagnostics()["info"]["usb_io"]` 可查看 USB 端点包长、读取队列、最大传输大小及当前 RAW_IO 状态。`raw_io=True` 可用于 WinUSB IN 管道对照试验；它要求读取缓冲区按端点包长对齐。2026-10-19 的 1 kHz 实机对比未显示明确收益，默认仍为 False。USB speed_code=1 按 WinUSB API 表示 full-speed-or-lower，不应直接解释成 low-speed。
-- `recv()` 超时返回 `None`；错误帧通过 `frame.is_error` 判断。
-- 单连接；打开、收发、关闭必须在同一线程执行。
-- `send()` 返回代表 USB 传输完成，不代表 CAN ACK；`close()` 停止适配器，不会发送电机失能命令。
+- `detect()`枚举设备；`inspect(serial_number)`读取能力，两者不启动CAN。
+- `open()`默认经典CAN 1Mbps；`fd=True`开启CAN FD，发送默认BRS，可传`brs=False`。
+- `send(can_id, data, is_extended=False)`返回表示USB传输完成，不表示CAN ACK或远端执行。
+- `recv(timeout)`返回下一帧或`None`；错误帧通过`frame.is_error`交给应用处理。
+- `diagnostics()`提供适配器信息；`filter_reports=True`仅汇总厂商无错误类别的低计数报告。实际协议错误不容忍、不自动吞掉。默认False保留原始报告。
+- `close()`停止适配器并释放USB，不发送电机失能命令。
+- 单连接、单所有者线程：打开、收发、关闭须在同一线程执行。多设备时必须指定序列号。
 
-适用设备：单通道 Candlelight 2.5，USB 1D50:606F / MI_00，固件白名单
-0x260618、0x260803、0x261001（实机验证版本为 0x261001）。不支持 SLCAN/串口模式。
-保留异步 USB 发送、复用缓冲区及 8 笔 USB 接收队列优化；Windows/Python 不保证硬实时 1 kHz。
+`low_latency=True`使用短时忙轮询，`high_priority=True`提升调用线程并在关闭时恢复；均可关闭。保留异步发送、8个接收请求和缓冲复用。`raw_io=False`保持原默认策略；实验选项`raw_io=True`不保证提速。CPU占用与延迟需要结合实际运行环境评估，Windows不保证硬实时。
 
-文件：`__init__.py` 为调用接口，`frame.py` 为帧结构，`transport.py` 为 USB/CAN 实现。
-系统若有其他同名包，请确保导入的是项目旁的 `canable`（可查看 `canable.__file__`）。
+## 脚本入口
 
-## C++ 高频核心（Windows x64 原型）
+`python demo.py`只枚举设备。明确指定ID才开始发送，例如：
 
-`canable/native.py` 是 Python 接口，`canable/_native.dll` 是已编译核心；源码在 `native/engine.cpp`，使用 MinGW 的 `native/build.ps1` 重编译。原有 Python API 保留。
+```powershell
+python demo.py --serial 20923378374350012 --id 0x123 --data 01020304 --rate 1000 --seconds 10
+```
+
+这是实际CAN FD+BRS周期发送示例，须按自己的设备协议选择ID/数据；不包含电机使能、失能或协议回复匹配。Ctrl+C停止适配器。
+
+## 可选：C++周期发送
 
 ```python
 from canable.native import NativeBus
-import time
 
-with NativeBus() as bus:
-    bus.start_sdo_test(node=1, rate=1000)  # mc_tools 协议：只读电机序列号
-    try:
-        while True:
-            time.sleep(1)
-            s = bus.stats()
-            print(s)
-            if not s['running']:
-                break
-    except KeyboardInterrupt:
-        pass
+with NativeBus(serial_number="20923378374350012") as bus:
+    bus.start_periodic(0x123, b"\x01\x02", rate=1000, seconds=10)
+    while bus.stats()["running"]:
+        while (frame := bus.recv()) is not None:
+            pass  # 这里处理或记录所有收到的帧
     bus.stop()
+    while (frame := bus.recv()) is not None:
+        pass
     print(bus.stats())
 ```
 
-通用发送用 `bus.start_periodic(can_id, data, rate=1000)`；`bus.update(data)` 更新下一周期的载荷。原生线程持续发送最新值，不需要 Python 每毫秒调用。仅支持标准 ID、CAN FD+BRS，载荷长度为 0..8、12、16、20、24、32、48、64。通用模式用 `bus.recv()` 非阻塞读取，返回原有 CanFrame；接收队列为 256 帧，应高频排空，不能每秒才读取一次。SDO 测试模式在原生侧匹配回复，不占用该队列。
+- 原生线程按期限发送最新载荷；`update(data)`替换下一周期载荷。只支持标准ID、FD+BRS；合法长度0..8、12、16、20、24、32、48、64。
+- `seconds=0`运行到显式`stop()`。超期时跳过旧时隙并计数，不堆积补发。约占用一个逻辑核心。
+- `recv()`非阻塞；接收队列256帧，应用须及时排空。队列溢出、USB/CAN错误停止周期发送，`stats()`报告错误。没有电机故障判断或自动重试。
+- 每个对象只启动一次。`stop()`等待原生I/O停止，`close()`释放USB。剩余已排入队列的帧可在stop后读取。`close()`不替代电机失能。
+- Python方法须由创建对象的线程调用；原生引擎独占该连接，不能同时用模块级接口读写同一适配器。
 
-所有 Python 方法必须在创建对象的线程调用，并用 `with` 或 `finally: bus.close()` 保证回收。每个 NativeBus 只启动一次；stop 后如需重启，重新创建对象。关闭会停止发送、等待 SDO 回复（最多约 1 秒），取消并回收 USB 请求，然后释放设备。读取 `stats()['running']`、`errors`、`timeouts` 判断是否异常停止；队列溢出、USB/CAN 错误不会静默忽略。停止适配器不等于给电机发送失能指令。
+统计：`submitted`为USB提交次数，`tx`为USB完整写完成数，`rx`为排队的CAN接收帧，`echoes`为适配器发送回显，`skipped`为跳过的时隙，`pending=submitted-tx`，`errors/win_error`为失败计数/原因。
 
-默认原生线程最高普通线程优先级、持续忙轮询，约占用一个逻辑核心。桌面 `canable_native_demo.py` 额外默认提升自身进程至 HIGH，每秒打印统计，Ctrl+C 退出，`--seconds 10` 可做定长测试。
+时间单位ms，`elapsed`为秒：`interval_avg/min/median/p99/max/std`测量**主机USB提交间隔**；median/p99使用10us桶向上取整，min/max为直接测量。`usb_avg/max`测量主机提交至检测到USB完成的历时，不是物理CAN发帧时间或远端响应延迟。
 
-统计为本轮累计值，时间指标单位 ms，elapsed 单位秒。submitted 为 USB 提交数，tx 为 USB 完成数，echoes 为适配器回显，rx 在 SDO 模式为匹配的电机回复数；这些完成阶段不能混同。TXdt 测量主机提交间隔，P99 用 10 us 桶向上取整；并非总线实际发帧时间，也不保证 Windows 硬实时。USB 忙或调度延迟时跳过已过期时隙，skipped 显式计数，不无限堆积发送。
+## 编译与版本边界
+
+附带DLL可直接用。修改C++源码后，使用MinGW x64运行`native/build.ps1`重建。Python/DLL ABI版本和结构尺寸不一致时，在打开设备前报错。
+
+已删除`start_sdo_test()`、电机序列号/SDO匹配和相关专用统计；旧电机测试脚本应把协议逻辑移至上层。同步接口原有open/send/recv/close用法保留。
+
+测试与原始记录放在SDK目录之外。当前1kHz实测结论见同级`canable_sdk_review_20261021/REPORT.md`，内部回环与实际电机通信分开解释。
