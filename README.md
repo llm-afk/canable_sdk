@@ -9,7 +9,7 @@ Windows + WinUSB，Python 3.11+。支持已验证的单通道 Candlelight 2.5，
 ```python
 import canable
 
-canable.open(serial_number="20923378374350012", fd=True,
+info = canable.open(serial_number="20923378374350012", fd=True,
              bitrate=1_000_000, data_bitrate=4_000_000)
 try:
     canable.send(0x123, b"\x01\x02")
@@ -20,15 +20,25 @@ finally:
     canable.close()
 ```
 
-- `detect()`枚举设备；`inspect(serial_number)`读取能力，两者不启动CAN。
+对外基础函数只有以下5个：
+
+| 接口 | 用途 |
+| --- | --- |
+| `detect()` | 枚举适配器，返回序列号等信息，不启动CAN |
+| `open(serial_number=None, *, bitrate=1000000, fd=False, data_bitrate=4000000, sample_point=75.0, data_sample_point=64.0, low_latency=True, high_priority=True)` | 打开连接，返回设备/固件/USB信息字典 |
+| `send(can_id, data, *, brs=None, is_extended=False)` | 发送一帧 |
+| `recv(timeout=0.1)` | 接收一帧，超时返回None |
+| `close()` | 停止适配器并释放连接，可重复调用 |
+
+`open()`返回的信息可以保存在应用中；不用再调用独立的inspect/diagnostics。
 - `open()`默认经典CAN 1Mbps；`fd=True`开启CAN FD，发送默认BRS，可传`brs=False`。
 - `send(can_id, data, is_extended=False)`返回表示USB传输完成，不表示CAN ACK或远端执行。
 - `recv(timeout)`返回下一帧或`None`；错误帧通过`frame.is_error`交给应用处理。
-- `diagnostics()`提供适配器信息；`filter_reports=True`仅汇总厂商无错误类别的低计数报告。实际协议错误不容忍、不自动吞掉。默认False保留原始报告。
+- 所有CAN错误/计数报告原样返回，SDK不做上层过滤或容忍；畸形USB帧抛出`UsbFrameError`（ValueError子类，包含原始帧证据）。
 - `close()`停止适配器并释放USB，不发送电机失能命令。
 - 单连接、单所有者线程：打开、收发、关闭须在同一线程执行。多设备时必须指定序列号。
 
-`low_latency=True`使用短时忙轮询，`high_priority=True`提升调用线程并在关闭时恢复；均可关闭。保留异步发送、8个接收请求和缓冲复用。`raw_io=False`保持原默认策略；实验选项`raw_io=True`不保证提速。CPU占用与延迟需要结合实际运行环境评估，Windows不保证硬实时。
+`low_latency=True`使用短时忙轮询，`high_priority=True`提升调用线程并在关闭时恢复；均可关闭。保留异步发送、8个接收请求和缓冲复用。USB IN固定使用已验证的缓冲策略，不再公开RAW_IO实验开关。CPU占用与延迟需要结合实际运行环境评估，Windows不保证硬实时。
 
 ## 脚本入口
 
@@ -56,6 +66,18 @@ with NativeBus(serial_number="20923378374350012") as bus:
     print(bus.stats())
 ```
 
+周期功能独立可选，只公开`NativeBus`及6个方法：
+
+| 接口 | 用途 |
+| --- | --- |
+| `NativeBus(serial_number=None, bitrate=1000000, data_bitrate=4000000)` | 创建并打开专用高频连接；设备信息通过`bus.info`读取 |
+| `start_periodic(can_id, data, rate=1000, seconds=0)` | 启动周期发送 |
+| `update(data)` | 替换下一周期载荷 |
+| `recv()` | 非阻塞读取接收队列 |
+| `stats()` | 读取运行状态、计数和周期统计 |
+| `stop()` | 停止周期发送，保留队列及统计供读取 |
+| `close()` | 停止并释放USB；支持with自动关闭 |
+
 - 原生线程按期限发送最新载荷；`update(data)`替换下一周期载荷。只支持标准ID、FD+BRS；合法长度0..8、12、16、20、24、32、48、64。
 - `seconds=0`运行到显式`stop()`。超期时跳过旧时隙并计数，不堆积补发。约占用一个逻辑核心。
 - `recv()`非阻塞；接收队列256帧，应用须及时排空。队列溢出、USB/CAN错误停止周期发送，`stats()`报告错误。没有电机故障判断或自动重试。
@@ -70,6 +92,6 @@ with NativeBus(serial_number="20923378374350012") as bus:
 
 附带DLL可直接用。修改C++源码后，使用MinGW x64运行`native/build.ps1`重建。Python/DLL ABI版本和结构尺寸不一致时，在打开设备前报错。
 
-已删除`start_sdo_test()`、电机序列号/SDO匹配和相关专用统计；旧电机测试脚本应把协议逻辑移至上层。同步接口原有open/send/recv/close用法保留。
+已删除`start_sdo_test()`、电机序列号/SDO匹配和相关专用统计；旧电机测试脚本应把协议逻辑移至上层。同步接口原有open/send/recv/close用法保留；open新增返回信息。inspect/diagnostics、公开常量SUPPORTED_FIRMWARE、filter_reports/raw_io选项删除，不保留兼容包装。
 
 测试与原始记录放在SDK目录之外。当前1kHz实测结论见同级`canable_sdk_review_20261021/REPORT.md`，内部回环与实际电机通信分开解释。

@@ -7,6 +7,8 @@ import threading
 from .transport import Canable, DLC_LENGTHS
 from .frame import CanFrame
 
+__all__ = ["NativeBus"]
+
 
 class _Stats(C.Structure):
     _fields_ = [(k, C.c_uint64) for k in
@@ -105,7 +107,7 @@ class NativeBus:
 
         tx counts USB completions, rx queued CAN data frames, echoes
         counts adapter echoes. Interval timestamps are host USB submissions.
-        p99 uses 10 us histogram bins. Inspect errors/timeouts/running every poll.
+        p99 uses 10 us histogram bins. Inspect errors/running every poll.
         """
         self._check()
         s = _Stats()

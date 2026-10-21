@@ -1,7 +1,7 @@
 """Windows WinUSB backend for the verified single-channel Candlelight 2.5.
 
 Uses legacy gs_usb frames (no Elmue blobs, no USB timestamps), not SLCAN.
-detect()/inspect() do not start CAN. open() configures and starts CAN.
+detect() does not start CAN. open() configures and starts CAN.
 """
 import ctypes as C
 from ctypes import wintypes as W
@@ -85,7 +85,7 @@ class _ThreadPriority:
 
 
 class _Usb:
-    def __init__(self, path, *, low_latency=True, raw_io=False):
+    def __init__(self, path, *, low_latency=True):
         # CPU/latency tradeoff, scoped to this connection. No global
         # timer resolution, process priority or send completion semantics change.
         self._read_spin = .002 if low_latency else .0006
@@ -139,13 +139,12 @@ class _Usb:
             _check(self.w.WinUsb_GetPipePolicy(self.usb, self.input, 8, C.byref(length), C.byref(maximum)))
             if self.read_size > maximum.value:
                 raise OSError("USB read buffer exceeds MAXIMUM_TRANSFER_SIZE")
-            # RAW_IO applies to IN only. Each buffer is packet-aligned; keep
-            # short-packet termination and ordered completion/requeue intact.
-            enabled = C.c_ubyte(bool(raw_io))
+            # Keep the verified buffered IN policy, including after another client.
+            enabled = C.c_ubyte(0)
             _check(self.w.WinUsb_SetPipePolicy(self.usb, self.input, 7, 1, C.byref(enabled)))
             actual, length = C.c_ubyte(), u(1)
             _check(self.w.WinUsb_GetPipePolicy(self.usb, self.input, 7, C.byref(length), C.byref(actual)))
-            if bool(actual.value) != bool(raw_io):
+            if actual.value != 0:
                 raise OSError("RAW_IO policy readback mismatch")
             speed, length = C.c_ubyte(), u(1)
             _check(self.w.WinUsb_QueryDeviceInformation(self.usb, 1, C.byref(length), C.byref(speed)))
@@ -402,7 +401,7 @@ ConvertTo-Json -InputObject $items -Compress
             raise OSError(f"USB discovery failed: {result.stderr.strip()}")
         return json.loads(result.stdout)
 
-    def __init__(self, serial_number=None, *, filter_reports=False, low_latency=True, raw_io=False):
+    def __init__(self, serial_number=None, *, low_latency=True):
         """只保存连接参数，不打开 USB。
 
         上层应用应传入指定 SN；None 仅在恰好一只适配器时可用。
@@ -410,11 +409,7 @@ ConvertTo-Json -InputObject $items -Compress
         """
         self.serial_number = serial_number
         self.low_latency = bool(low_latency)
-        self.raw_io = bool(raw_io)
-        self.filter_reports = filter_reports
         self._fd = True
-        self.counter_reports = 0
-        self.last_counter_report = None
         self._usb = None
         self._configured = False
         self._started = False
@@ -427,7 +422,7 @@ ConvertTo-Json -InputObject $items -Compress
         if len(devices) != 1:
             serials = ', '.join(d['serial_number'] for d in available) or '(none)'
             raise OSError(f"matched {len(devices)} CANable devices; connected serials: {serials}; specify --serial when multiple adapters are connected")
-        return _Usb(devices[0]["path"], low_latency=self.low_latency, raw_io=self.raw_io)
+        return _Usb(devices[0]["path"], low_latency=self.low_latency)
 
     @staticmethod
     def _info(usb):
@@ -436,16 +431,6 @@ ConvertTo-Json -InputObject $items -Compress
         return dict(firmware=f"0x{sw:06X}", hardware=f"0x{hw:X}", hal=f"{major}.{minor}.{patch}",
                     channels=count+1, features=f"0x{caps[0]:08X}", clock_hz=caps[1],
                     nominal_limits=caps[2:10], data_limits=caps[10:18])
-
-    def inspect(self):
-        """Only GET requests; does not reset/configure/start CAN."""
-        if self._usb:
-            raise RuntimeError("inspect before opening CAN")
-        usb = self._connect()
-        try:
-            return self._info(usb)
-        finally:
-            usb.close()
 
     def _set(self, request, data):
         self._usb.control(request, data=data)
@@ -469,8 +454,6 @@ ConvertTo-Json -InputObject $items -Compress
             nominal = bit_timing(self.info["clock_hz"], bitrate, sample_point, self.info["nominal_limits"])
             data = bit_timing(self.info["clock_hz"], data_bitrate, data_sample_point, self.info["data_limits"]) if fd else None
             self._fd = bool(fd)
-            self.counter_reports = 0
-            self.last_counter_report = None
             self._configured = True
             self._set(2, struct.pack("<II", 0, 0))
             self._set(0, struct.pack("<I", 0xBEEF))
@@ -506,15 +489,6 @@ ConvertTo-Json -InputObject $items -Compress
                     del self._rx[:size]
                     frame = decode_usb(packet)
                     if frame is not None:
-                        # Elmue legacy reports counter changes with CAN_ERR_FLAG even
-                        # when no error class is set (Firmware/Candlelight/buffer.c,
-                        # buf_store_error). Keep diagnostics; this is not motor data.
-                        if self.filter_reports and is_counter_report(frame):
-                            self.counter_reports += 1
-                            self.last_counter_report = {
-                                'tx_errors': frame.data[6], 'rx_errors': frame.data[7],
-                                'received_at': time.perf_counter()}
-                            continue
                         return frame
                     continue
             remaining = deadline - time.perf_counter()
@@ -535,15 +509,3 @@ ConvertTo-Json -InputObject $items -Compress
             self._rx.clear()
             if usb:
                 usb.close()
-
-
-def is_counter_report(frame):
-    """Identify class-free Elmue counter reports for optional diagnostics.
-
-    Byte 5 contains firmware application faults: never discard a nonzero value.
-    Actual protocol errors, warning/passive/bus-off and malformed frames pass on.
-    """
-    return (frame.is_error and frame.can_id == 0 and not frame.is_fd
-            and not frame.is_extended and not frame.is_remote
-            and len(frame.data) == 8 and frame.data[:6] == bytes(6)
-            and max(frame.data[6:]) < 96)
