@@ -1,0 +1,4 @@
+include README.md
+include canable/_native.dll
+recursive-include native *.cpp *.ps1
+recursive-include tests *.py *.cpp

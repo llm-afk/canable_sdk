@@ -5,6 +5,7 @@ from .frame import CanFrame as _Frame
 from .transport import _ThreadPriority
 
 __all__ = ['detect', 'open', 'send', 'recv', 'close', 'UsbFrameError']
+__version__ = '0.2.0'
 _bus = None
 _owner = None
 _fd = False

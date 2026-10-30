@@ -12,21 +12,23 @@ __all__ = ["NativeBus"]
 
 class _Stats(C.Structure):
     _fields_ = [(k, C.c_uint64) for k in
-                'submitted tx rx echoes skipped errors pending running win_error'.split()] + [
+                'submitted tx rx echoes skipped errors pending running win_error delivered queued queue_high_water can_errors unparsed_bytes'.split()] + [
                 (k, C.c_double) for k in
                 'elapsed interval_avg interval_min interval_median interval_p99 interval_max interval_std usb_avg usb_max'.split()]
 
 
 class _Frame(C.Structure):
-    _fields_ = [('id', C.c_uint32), ('size', C.c_uint32), ('flags', C.c_uint32), ('data', C.c_ubyte * 64)]
+    _fields_ = [('id', C.c_uint32), ('size', C.c_uint32), ('flags', C.c_uint32),
+                ('data', C.c_ubyte * 64), ('timestamp_ns', C.c_uint64), ('sequence', C.c_uint64)]
 
 
 class NativeBus:
     """Exclusive USB ownership; continuous busy polling consumes about one CPU core.
 
-    TX is standard-ID CAN FD+BRS. Generic RX queue holds 256 frames: drain it
-    frequently. Queue overflow and CAN/USB errors stop transmission, never hide loss.
-    stop() joins native I/O; close() then releases USB. No background Python callbacks.
+    TX is standard-ID CAN FD+BRS. RX storage grows as needed; drain it regularly
+    and monitor queued/queue_high_water. CAN error reports are returned as frames.
+    stop() collects successful pending reads and joins I/O; drain before close().
+    Memory exhaustion and USB/protocol failures remain explicit fatal errors.
     """
     def __init__(self, serial_number=None, bitrate=1_000_000, data_bitrate=4_000_000):
         self._owner = threading.get_ident()
@@ -41,6 +43,7 @@ class NativeBus:
             'native_stop': ([C.c_void_p], None), 'native_free': ([C.c_void_p], None),
             'native_update': ([C.c_void_p, C.c_void_p, C.c_uint], C.c_int),
             'native_recv': ([C.c_void_p, C.POINTER(_Frame)], C.c_int),
+            'native_recv_many': ([C.c_void_p, C.POINTER(_Frame), C.c_uint], C.c_uint),
             'native_stats': ([C.c_void_p, C.POINTER(_Stats)], C.c_int),
         }
         for name, (args, result) in specs.items():
@@ -49,7 +52,7 @@ class NativeBus:
             except AttributeError as exc:
                 raise RuntimeError('Native DLL ABI mismatch; rebuild native/engine.cpp') from exc
             fn.argtypes, fn.restype = args, result
-        if (d.native_version() != 2 or d.native_size(0) != C.sizeof(_Stats)
+        if (d.native_version() != 3 or d.native_size(0) != C.sizeof(_Stats)
                 or d.native_size(1) != C.sizeof(_Frame)):
             raise RuntimeError('Native DLL ABI mismatch; rebuild native/engine.cpp')
         self._bus = Canable(serial_number).open(bitrate, data_bitrate)
@@ -99,14 +102,32 @@ class NativeBus:
         f = _Frame()
         if not self._dll.native_recv(self._ctx, C.byref(f)):
             return None
+        return self._frame(f)
+
+    @staticmethod
+    def _frame(f):
         return CanFrame(f.id, bytes(f.data[:f.size]), bool(f.flags & 2), bool(f.flags & 4),
-                        bool(f.flags & 0x100), False, bool(f.flags & 0x200))
+                        bool(f.flags & 0x100), bool(f.flags & 0x400), bool(f.flags & 0x200),
+                        f.timestamp_ns, f.sequence)
+
+    def recv_many(self, max_frames=1024):
+        """Nonblocking FIFO batch. Reduces DLL crossings; does not limit RX storage."""
+        self._check()
+        if type(max_frames) is not int or not 1 <= max_frames <= 65536:
+            raise ValueError('max_frames must be an integer in [1,65536]')
+        if not hasattr(self, '_batch') or len(self._batch) < max_frames:
+            self._batch = (_Frame * max_frames)()
+        count = self._dll.native_recv_many(self._ctx, self._batch, max_frames)
+        return [self._frame(self._batch[i]) for i in range(count)]
 
     def stats(self):
         """Cumulative statistics; durations in milliseconds, elapsed in seconds.
 
         tx counts USB completions, rx queued CAN data frames, echoes
         counts adapter echoes. Interval timestamps are host USB submissions.
+        delivered counts frames removed by recv/recv_many; queued is current RX
+        depth. queue_high_water observes backlog. can_errors counts CAN reports;
+        unparsed_bytes flags an incomplete/invalid USB tail at stop.
         p99 uses 10 us histogram bins. Inspect errors/running every poll.
         """
         self._check()

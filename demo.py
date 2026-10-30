@@ -24,7 +24,7 @@ def main():
         last = 0
         try:
             while True:
-                while bus.recv() is not None:
+                while bus.recv_many():
                     pass  # This example counts frames; replace with application handling.
                 stats = bus.stats()
                 if stats['elapsed'] - last >= 1 or not stats['running']:
@@ -37,8 +37,10 @@ def main():
             pass
         finally:
             bus.stop()
+            while bus.recv_many():
+                pass  # Consume successful completions collected during stop.
         print('FINAL', json.dumps(bus.stats()))
-        return int(bool(bus.stats()['errors'] or bus.stats()['pending']))
+        return int(bool(bus.stats()['errors'] or bus.stats()['pending'] or bus.stats()['unparsed_bytes']))
 
 
 if __name__ == '__main__':

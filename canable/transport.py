@@ -5,6 +5,7 @@ detect() does not start CAN. open() configures and starts CAN.
 """
 import ctypes as C
 from ctypes import wintypes as W
+from dataclasses import replace
 import json
 import math
 import os
@@ -121,6 +122,7 @@ class _Usb:
         self._tx_event = None
         self._tx_pending = False
         self._write_timeouts = {}
+        self.last_read_ns = None
         try:
             _check(self.w.WinUsb_Initialize(self.handle, C.byref(self.usb)))
             pipes = []
@@ -258,6 +260,7 @@ class _Usb:
                 ok = self.w.WinUsb_GetOverlappedResult(self.usb, C.byref(slot.overlapped), C.byref(n), False)
                 slot.pending = False
                 _check(ok)
+                self.last_read_ns = time.perf_counter_ns()
                 data = C.string_at(slot.buffer, n.value)
                 self._submit_read(slot)  # Requeue at the USB tail before decoding.
                 self._read_head = (self._read_head + 1) % len(self._reads)
@@ -415,6 +418,8 @@ ConvertTo-Json -InputObject $items -Compress
         self._started = False
         self._echo = 0
         self._rx = bytearray()
+        self._rx_timestamp_ns = None
+        self._rx_sequence = 0
 
     def _connect(self):
         available = self.detect()
@@ -461,6 +466,8 @@ ConvertTo-Json -InputObject $items -Compress
             if fd:
                 self._set(10, struct.pack("<5I", *data))
             self._set(2, struct.pack("<II", 1, 0x100 if fd else 0))
+            self._rx_sequence = 0
+            self._rx_timestamp_ns = None
             self._started = True
             return self
         except BaseException:
@@ -489,7 +496,9 @@ ConvertTo-Json -InputObject $items -Compress
                     del self._rx[:size]
                     frame = decode_usb(packet)
                     if frame is not None:
-                        return frame
+                        self._rx_sequence += 1
+                        return replace(frame, timestamp_ns=self._rx_timestamp_ns,
+                                       sequence=self._rx_sequence)
                     continue
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
@@ -497,6 +506,8 @@ ConvertTo-Json -InputObject $items -Compress
             chunk = self._usb.transfer(self._usb.input, timeout=remaining)
             if chunk is None:
                 return None
+            observed = getattr(self._usb, 'last_read_ns', None)
+            self._rx_timestamp_ns = observed if observed is not None else time.perf_counter_ns()
             self._rx.extend(chunk)
 
     def close(self):

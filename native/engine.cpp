@@ -1,11 +1,16 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <new>
 #include <thread>
@@ -15,12 +20,14 @@
 #define API extern "C" __declspec(dllexport)
 struct Stats {
     uint64_t submitted, tx, rx, echoes, skipped, errors, pending, running, win_error;
+    uint64_t delivered, queued, queue_high_water, can_errors, unparsed_bytes;
     double elapsed, interval_avg, interval_min, interval_median, interval_p99, interval_max, interval_std,
         usb_avg, usb_max;
 };
 struct Frame {
     uint32_t id, size, flags;
     unsigned char data[64];
+    uint64_t timestamp_ns, sequence;
 };
 struct Metric {
     uint64_t count = 0;
@@ -70,13 +77,20 @@ struct Context {
     std::mutex mutex;
     Stats stats{};
     Metric intervals, writes;
-    std::array<Frame, 256> frames{};
-    unsigned head = 0, tail = 0, count = 0;
+    std::deque<Frame> frames;
     double freq = 0, origin = 0;
     double clock() const {
         LARGE_INTEGER x;
         QueryPerformanceCounter(&x);
         return x.QuadPart / freq;
+    }
+    uint64_t timestamp_ns() const {
+        LARGE_INTEGER x;
+        QueryPerformanceCounter(&x);
+        auto ticks = static_cast<uint64_t>(x.QuadPart);
+        auto hz = static_cast<uint64_t>(freq);
+        return (ticks / hz) * 1000000000ULL +
+               static_cast<uint64_t>(static_cast<long double>(ticks % hz) * 1000000000ULL / hz);
     }
     void fail(DWORD code) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -96,8 +110,8 @@ static int dlc(unsigned size) {
             return i;
     return -1;
 }
-// One complete legacy gs_usb frame; same bounded queue for all CAN IDs.
-static bool consume(Context *c, const unsigned char *p) {
+// One complete legacy gs_usb frame. No artificial queue-depth stop policy.
+static bool consume(Context *c, const unsigned char *p, uint64_t timestamp_ns) {
     bool fd = (p[10] & 2) != 0;
     if (p[9] != 0 || p[8] > (fd ? 15 : 8) || (p[10] & 1)) {
         c->fail(ERROR_INVALID_DATA);
@@ -109,26 +123,81 @@ static bool consume(Context *c, const unsigned char *p) {
     if (u32(p) != 0xffffffff) {
         std::lock_guard<std::mutex> lock(c->mutex);
         ++c->stats.echoes;
-    } else if (id & 0x20000000) {
-        c->fail(ERROR_IO_DEVICE);
-        return false;
     } else {
         std::lock_guard<std::mutex> lock(c->mutex);
-        if (c->count == c->frames.size()) {
-            ++c->stats.errors;
-            c->stats.win_error = ERROR_BUFFER_OVERFLOW;
-            return false;
-        }
-        Frame &f = c->frames[c->tail];
+        Frame f{};
         f.id = id & 0x1fffffff;
         f.size = payload;
-        f.flags = p[10] | ((id & 0x80000000) ? 0x100 : 0) | ((id & 0x40000000) ? 0x200 : 0);
+        f.flags = p[10] | ((id & 0x80000000) ? 0x100 : 0) |
+                  ((id & 0x40000000) ? 0x200 : 0) | ((id & 0x20000000) ? 0x400 : 0);
         memcpy(f.data, p + 12, payload);
-        c->tail = (c->tail + 1) % c->frames.size();
-        ++c->count;
+        f.timestamp_ns = timestamp_ns;
+        f.sequence = c->stats.rx + 1;
+        try {
+            c->frames.push_back(f);
+        } catch (const std::bad_alloc &) {
+            ++c->stats.errors;
+            c->stats.win_error = ERROR_NOT_ENOUGH_MEMORY;
+            return false;
+        }
         ++c->stats.rx;
+        c->stats.queue_high_water = std::max(c->stats.queue_high_water,
+                                          static_cast<uint64_t>(c->frames.size()));
+        if (id & 0x20000000)
+            ++c->stats.can_errors;
     }
     return true;
+}
+struct Stream {
+    std::array<unsigned char, 8192> data{};
+    size_t used = 0;
+    bool failed = false;
+};
+static bool append_data(Context *c, Stream &stream, const unsigned char *data, size_t size) {
+    if (stream.failed)
+        return false;
+    if (size > stream.data.size() - stream.used) {
+        c->fail(ERROR_BUFFER_OVERFLOW);
+        stream.failed = true;
+        return false;
+    }
+    if (size)
+        memcpy(stream.data.data() + stream.used, data, size);
+    stream.used += size;
+    return true;
+}
+static bool parse_stream(Context *c, Stream &stream, uint64_t timestamp_ns) {
+    if (stream.failed)
+        return false;
+    size_t offset = 0;
+    while (stream.used - offset >= 12) {
+        const auto *p = stream.data.data() + offset;
+        unsigned length = p[10] & 2 ? 76 : 20;
+        if (stream.used - offset < length)
+            break;
+        if (!consume(c, p, timestamp_ns)) {
+            stream.failed = true;
+            break;
+        }
+        offset += length;
+    }
+    if (offset) {
+        memmove(stream.data.data(), stream.data.data() + offset, stream.used - offset);
+        stream.used -= offset;
+    }
+    return !stream.failed;
+}
+static bool accept(Context *c, Stream &stream, const unsigned char *data, size_t size,
+                   uint64_t timestamp_ns) {
+    return append_data(c, stream, data, size) && parse_stream(c, stream, timestamp_ns);
+}
+static void finish_stream(Context *c, const Stream &stream) {
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        c->stats.unparsed_bytes = stream.used;
+    }
+    if (stream.used && !stream.failed)
+        c->fail(ERROR_INVALID_DATA);
 }
 static bool issue(Context *c, Slot &s) {
     ResetEvent(s.ov.hEvent);
@@ -157,8 +226,7 @@ static void run(Context *c) {
     OVERLAPPED txov{};
     bool txpending = false;
     std::array<unsigned char, 76> tx{};
-    std::array<unsigned char, 8192> stream{};
-    size_t used = 0;
+    Stream stream;
     unsigned echo = 1;
     double due = c->origin, previous = 0, txstart = 0, period = 1 / c->rate;
     bool good = true;
@@ -265,32 +333,19 @@ static void run(Context *c) {
                 c->fail(GetLastError());
                 break;
             }
-            if (n > s.data.size() || used + n > stream.size()) {
+            if (n > s.data.size()) {
                 c->fail(ERROR_BUFFER_OVERFLOW);
                 break;
             }
-            memcpy(stream.data() + used, s.data.data(), n);
-            used += n;
-            if (!issue(c, s))
+            auto observed_ns = c->timestamp_ns();
+            if (!append_data(c, stream, s.data.data(), n))
                 break;
+            // Copy before rearming, then parse from independent stream storage.
+            // Even if rearming fails, preserve the successful completion above.
+            bool issued = issue(c, s);
             readhead = (readhead + 1) % 8;
-            size_t offset = 0;
-            while (used - offset >= 12) {
-                const unsigned char *p = stream.data() + offset;
-                bool fd = p[10] & 2;
-                unsigned length = fd ? 76 : 20;
-                if (used - offset < length)
-                    break;
-                if (!consume(c, p)) {
-                    good = false;
-                    break;
-                }
-                offset += length;
-            }
-            if (offset) {
-                memmove(stream.data(), stream.data() + offset, used - offset);
-                used -= offset;
-            }
+            bool accepted = parse_stream(c, stream, observed_ns);
+            good = issued && accepted;
         } else if (state != WAIT_TIMEOUT) {
             c->fail(GetLastError());
             break;
@@ -306,16 +361,29 @@ static void run(Context *c) {
     for (auto &s : reads)
         if (s.pending)
             CancelIoEx(c->file, &s.ov);
-    for (auto &s : reads) {
+    // Preserve successful completions, including races with cancellation, in
+    // USB submission order. Pending aborted reads contain no complete result.
+    for (unsigned offset = 0; offset < reads.size(); ++offset) {
+        auto &s = reads[(readhead + offset) % reads.size()];
         if (s.pending) {
             ULONG n = 0;
-            WinUsb_GetOverlappedResult(c->usb, &s.ov, &n, TRUE);
+            BOOL ok = WinUsb_GetOverlappedResult(c->usb, &s.ov, &n, TRUE);
+            if (ok) {
+                if (n > s.data.size())
+                    c->fail(ERROR_BUFFER_OVERFLOW);
+                else
+                    accept(c, stream, s.data.data(), n, c->timestamp_ns());
+            } else if (GetLastError() != ERROR_OPERATION_ABORTED) {
+                c->fail(GetLastError());
+            }
+            s.pending = false;
         }
         if (s.ov.hEvent)
             CloseHandle(s.ov.hEvent);
     }
     if (txov.hEvent)
         CloseHandle(txov.hEvent);
+    finish_stream(c, stream);
     {
         std::lock_guard<std::mutex> lock(c->mutex);
         c->stats.elapsed = c->clock() - c->origin;
@@ -324,10 +392,10 @@ static void run(Context *c) {
     }
 }
 API unsigned native_version() {
-    return 2;
+    return 3;
 }
 API unsigned native_size(unsigned i) {
-    return i == 0 ? sizeof(Stats) : sizeof(Frame);
+    return i == 0 ? sizeof(Stats) : i == 1 ? sizeof(Frame) : 0;
 }
 API void *native_start(void *file, void *usb, unsigned input, unsigned output, unsigned id,
                        const unsigned char *data, unsigned size, double rate, double duration) {
@@ -382,17 +450,21 @@ API int native_update(void *ptr, const unsigned char *data, unsigned size) {
         memcpy(c->payload, data, size);
     return 1;
 }
-API int native_recv(void *ptr, Frame *out) {
+API unsigned native_recv_many(void *ptr, Frame *out, unsigned capacity) {
     auto *c = static_cast<Context *>(ptr);
-    if (!c || !out)
+    if (!c || !out || !capacity)
         return 0;
     std::lock_guard<std::mutex> lock(c->mutex);
-    if (!c->count)
-        return 0;
-    *out = c->frames[c->head];
-    c->head = (c->head + 1) % c->frames.size();
-    --c->count;
-    return 1;
+    unsigned count = static_cast<unsigned>(std::min(c->frames.size(), static_cast<size_t>(capacity)));
+    for (unsigned i = 0; i < count; ++i) {
+        out[i] = c->frames.front();
+        c->frames.pop_front();
+    }
+    c->stats.delivered += count;
+    return count;
+}
+API int native_recv(void *ptr, Frame *out) {
+    return native_recv_many(ptr, out, 1) != 0;
 }
 API int native_stats(void *ptr, Stats *out) {
     auto *c = static_cast<Context *>(ptr);
@@ -400,6 +472,7 @@ API int native_stats(void *ptr, Stats *out) {
         return 0;
     std::lock_guard<std::mutex> lock(c->mutex);
     *out = c->stats;
+    out->queued = c->frames.size();
     if (out->running && c->origin)
         out->elapsed = c->clock() - c->origin;
     out->interval_avg = c->intervals.avg();

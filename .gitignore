@@ -1,3 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+build/
+dist/
+*.egg-info/
+tests/_build/
