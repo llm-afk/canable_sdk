@@ -389,6 +389,7 @@ class Canable:
         if os.name != "nt":
             raise OSError("CANable WinUSB discovery requires Windows")
         script = r'''
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $ErrorActionPreference = 'Stop'
 $items = @(Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'USB\VID_1D50&PID_606F&MI_00\*' } | ForEach-Object {
   $id = $_.InstanceId
@@ -399,9 +400,10 @@ $items = @(Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'USB\
 ConvertTo-Json -InputObject $items -Compress
 '''
         result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                                capture_output=True, text=True, timeout=30, creationflags=0x08000000)
+                                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                timeout=30, creationflags=0x08000000)
         if result.returncode:
-            raise OSError(f"USB discovery failed: {result.stderr.strip()}")
+            raise OSError(f"USB discovery failed: {(result.stderr or '').strip()}")
         return json.loads(result.stdout)
 
     def __init__(self, serial_number=None, *, low_latency=True):
