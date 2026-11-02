@@ -12,13 +12,14 @@ _fd = False
 _priority = None
 _lock = _threading.RLock()
 
-def detect():
+def detect(*,timeout=3.0,cancel_event=None):
     """Enumerate USB devices without starting CAN."""
-    return _Canable.detect()
+    return _Canable.detect(timeout=timeout,cancel_event=cancel_event)
 
 def open(serial_number=None, *, bitrate=1_000_000, fd=False,
          data_bitrate=4_000_000, sample_point=75.0, data_sample_point=64.0,
-         low_latency=True, high_priority=True):
+         low_latency=True, high_priority=True,discovery_timeout=3.0,
+         cancel_event=None,on_progress=None):
     """Open one connection and return adapter information.
 
     Defaults to classic CAN, 1 Mbps. low_latency defaults to True; it does not
@@ -29,7 +30,8 @@ def open(serial_number=None, *, bitrate=1_000_000, fd=False,
     with _lock:
         if _bus is not None:
             raise RuntimeError('CANable already open; close it before opening again')
-        bus = _Canable(serial_number, low_latency=low_latency)
+        bus = _Canable(serial_number, low_latency=low_latency,discovery_timeout=discovery_timeout,
+                       cancel_event=cancel_event,on_progress=on_progress)
         # Transport.open performs rollback on failure. Publish only after success.
         bus.open(bitrate=bitrate, data_bitrate=data_bitrate, sample_point=sample_point,
                  data_sample_point=data_sample_point, fd=fd)

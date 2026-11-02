@@ -6,14 +6,13 @@ detect() does not start CAN. open() configures and starts CAN.
 import ctypes as C
 from ctypes import wintypes as W
 from dataclasses import replace
-import json
 import math
 import os
 import struct
-import subprocess
 import time
 
 from .frame import CanFrame
+from .discovery import detect as discover
 
 DLC_LENGTHS = (*range(9), 12, 16, 20, 24, 32, 48, 64)
 SUPPORTED_FIRMWARE = ("0x260618", "0x260803", "0x261001")
@@ -380,33 +379,16 @@ def decode_usb(packet):
 class Canable:
     """Exclusive single-channel connection; all I/O must have one owner thread."""
     @staticmethod
-    def detect():
+    def detect(*,timeout=3.0,cancel_event=None):
         """列出已连接适配器，返回包含 serial_number 和 USB path 的字典列表。
 
         仅枚举设备，不启动 CAN。上层使用 serial_number 配置目标适配器，
         不保存可能随插口变化的 path。
         """
-        if os.name != "nt":
-            raise OSError("CANable WinUSB discovery requires Windows")
-        script = r'''
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$ErrorActionPreference = 'Stop'
-$items = @(Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'USB\VID_1D50&PID_606F&MI_00\*' } | ForEach-Object {
-  $id = $_.InstanceId
-  $parent = (Get-PnpDeviceProperty -InstanceId $id -KeyName DEVPKEY_Device_Parent).Data
-  $guid = (Get-ItemProperty -LiteralPath ('HKLM:\SYSTEM\CurrentControlSet\Enum\' + $id + '\Device Parameters')).DeviceInterfaceGUIDs[0]
-  [pscustomobject]@{serial_number=$parent.Split('\')[-1]; path=('\\?\' + $id.Replace('\','#') + '#' + $guid)}
-})
-ConvertTo-Json -InputObject $items -Compress
-'''
-        result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                timeout=30, creationflags=0x08000000)
-        if result.returncode:
-            raise OSError(f"USB discovery failed: {(result.stderr or '').strip()}")
-        return json.loads(result.stdout)
+        return discover(timeout=timeout,cancel_event=cancel_event)
 
-    def __init__(self, serial_number=None, *, low_latency=True):
+    def __init__(self, serial_number=None, *, low_latency=True,discovery_timeout=3.0,
+                 cancel_event=None,on_progress=None):
         """只保存连接参数，不打开 USB。
 
         上层应用应传入指定 SN；None 仅在恰好一只适配器时可用。
@@ -414,6 +396,9 @@ ConvertTo-Json -InputObject $items -Compress
         """
         self.serial_number = serial_number
         self.low_latency = bool(low_latency)
+        self.discovery_timeout=discovery_timeout
+        self.cancel_event=cancel_event
+        self.on_progress=on_progress
         self._fd = True
         self._usb = None
         self._configured = False
@@ -424,12 +409,20 @@ ConvertTo-Json -InputObject $items -Compress
         self._rx_sequence = 0
 
     def _connect(self):
-        available = self.detect()
+        self._progress('discovering')
+        available = self.detect(timeout=self.discovery_timeout,cancel_event=self.cancel_event)
         devices = [d for d in available if self.serial_number is None or d["serial_number"] == self.serial_number]
         if len(devices) != 1:
             serials = ', '.join(d['serial_number'] for d in available) or '(none)'
             raise OSError(f"matched {len(devices)} CANable devices; connected serials: {serials}; specify --serial when multiple adapters are connected")
+        self.serial_number=devices[0]['serial_number']
+        self._progress('opening_usb')
         return _Usb(devices[0]["path"], low_latency=self.low_latency)
+
+    def _progress(self,phase):
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise InterruptedError('cancelled before CAN startup')
+        if self.on_progress:self.on_progress(phase)
 
     @staticmethod
     def _info(usb):
@@ -452,7 +445,9 @@ ConvertTo-Json -InputObject $items -Compress
             raise RuntimeError("CANable already open")
         self._usb = self._connect()
         try:
+            self._progress('reading_adapter')
             self.info = self._info(self._usb)
+            self.info['serial_number']=self.serial_number
             self.info["usb_io"] = self._usb.io_info.copy()
             if (self.info["channels"] != 1 or self.info["firmware"] not in SUPPORTED_FIRMWARE
                     or int(self.info["features"], 16) & 0x4500 != 0x4500):
@@ -461,6 +456,7 @@ ConvertTo-Json -InputObject $items -Compress
             nominal = bit_timing(self.info["clock_hz"], bitrate, sample_point, self.info["nominal_limits"])
             data = bit_timing(self.info["clock_hz"], data_bitrate, data_sample_point, self.info["data_limits"]) if fd else None
             self._fd = bool(fd)
+            self._progress('starting_can')
             self._configured = True
             self._set(2, struct.pack("<II", 0, 0))
             self._set(0, struct.pack("<I", 0xBEEF))

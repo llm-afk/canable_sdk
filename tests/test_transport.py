@@ -16,20 +16,16 @@ def received(frame):
 
 
 class DiscoveryTests(unittest.TestCase):
-    def test_discovery_uses_explicit_utf8_and_retains_localized_failure(self):
-        with patch('canable.transport.subprocess.run', return_value=SimpleNamespace(
-                returncode=1, stdout='', stderr='无法从客户端中访问 CIM 资源。')) as run:
-            with self.assertRaisesRegex(OSError, 'CIM'):
+    def test_native_discovery_retains_localized_failure(self):
+        with patch('canable.transport.discover',side_effect=OSError('无法访问设备注册信息')):
+            with self.assertRaisesRegex(OSError, '设备注册信息'):
                 Canable.detect()
-        self.assertEqual(run.call_args.kwargs['encoding'], 'utf-8')
-        self.assertEqual(run.call_args.kwargs['errors'], 'replace')
-        self.assertIn('OutputEncoding', run.call_args.args[0][-1])
 
-    def test_discovery_empty_stderr_does_not_mask_original_failure(self):
-        with patch('canable.transport.subprocess.run', return_value=SimpleNamespace(
-                returncode=1, stdout='', stderr=None)):
-            with self.assertRaisesRegex(OSError, 'USB discovery failed'):
-                Canable.detect()
+    def test_native_discovery_forwards_timeout_and_cancellation(self):
+        event=threading.Event()
+        with patch('canable.transport.discover',return_value=[]) as discover:
+            self.assertEqual(Canable.detect(timeout=2,cancel_event=event),[])
+        discover.assert_called_once_with(timeout=2,cancel_event=event)
 
 
 class CodecTests(unittest.TestCase):

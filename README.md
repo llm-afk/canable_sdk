@@ -121,7 +121,11 @@ python -B -m unittest discover -s tests -v
 
 默认测试不枚举或打开设备。native 测试包含 10 万帧队列/FIFO/批量元数据检查，以及用假 WinUSB 完成结果验证正常停止与尾部处理；不访问 USB，也不是实际总线吞吐测试。
 
-设备发现使用 Windows PnP／CIM，运行环境必须允许访问该服务；SDK 不自动提升权限。PowerShell 输出与 Python 解码均显式使用 UTF-8，中文系统的发现失败保留原始错误，避免解码异常遮蔽权限／设备问题。2026-11-02 的 Python 离线检查为 26 项通过，包含两项此路径的回归；未改动原生 DLL／ABI。
+设备发现使用 Windows 原生 Configuration Manager 与只读设备注册信息，不启动 PowerShell 或扫描整机 CIM。仅交付当前活跃的 WinUSB 接口及其父设备序号，不返回注册表中的离线旧路径；`detect()` 不打开 USB／启动 CAN。实现依据微软的 [接口枚举](https://learn.microsoft.com/en-us/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_get_device_interface_listw)和[父设备查询](https://learn.microsoft.com/en-us/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_get_parent)。
+
+基础五函数继续可用。`detect(timeout=3.0, cancel_event=None)` 可在原生查询之间检查期限和取消；已经执行中的系统调用不能强制打断。`open(..., discovery_timeout=3.0, cancel_event=None, on_progress=None)` 仅发现一次，进度回调依次为 discovering／opening_usb／reading_adapter／starting_can；返回信息新增选中的 serial_number。取消和回调异常沿用打开失败的回滚规则，不自动重试或提升权限。
+
+2026-11-02 的 Python 离线检查为 32 项通过，覆盖活跃／离线接口、多个设备、缺失驱动 GUID、取消／期限和一次发现／阶段回调。使用方当前环境只读发现实测约 1.97 ms，找到序号 20923378374350012；该测量没有打开 USB 或启动 CAN，不等于总连接耗时或所有电脑的性能保证。此前 PnP／CIM 编码修复保留在历史提交中，当前路径已替换；原生 DLL／ABI 未改。
 
 `test.ps1 -Native` 需要 MinGW x64 的 `g++.exe`，先重建 DLL，再运行 Python 与原生离线检查。也可单独执行：
 
