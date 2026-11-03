@@ -48,7 +48,7 @@ def open(serial_number=None, *, bitrate=1_000_000, fd=False,
 
 def _connection():
     if _bus is None:
-        raise RuntimeError('CANable is not open; call canable.open() first')
+        raise RuntimeError('CANable is not open; call canable_sdk.open() first')
     if _owner != _threading.get_ident():
         raise RuntimeError('CANable operations must run on the thread that called open()')
     return _bus

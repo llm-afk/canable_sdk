@@ -6,7 +6,7 @@ Windows WinUSB 的单通道 CANable 通信 SDK，Python 3.11+。默认 Python �
 
 ## 安装
 
-运行时没有第三方 Python 依赖。复制 `canable/` 到主程序旁仍可使用，也支持在隔离环境中安装：
+运行时没有第三方 Python 依赖。复制 `canable_sdk/` 到主程序旁仍可使用，也支持在隔离环境中安装：
 
 ```powershell
 py -3.11 -m venv .venv
@@ -18,17 +18,17 @@ py -3.11 -m venv .venv
 ## 基础接口
 
 ```python
-import canable
+import canable_sdk
 
-info = canable.open(serial_number="your-serial-number", fd=True,
+info = canable_sdk.open(serial_number="your-serial-number", fd=True,
                     bitrate=1_000_000, data_bitrate=4_000_000)
 try:
-    canable.send(0x123, b"\x01\x02")
-    frame = canable.recv(timeout=0.1)
+    canable_sdk.send(0x123, b"\x01\x02")
+    frame = canable_sdk.recv(timeout=0.1)
     if frame is not None:
         print(frame.can_id, frame.data, frame.timestamp_ns, frame.sequence)
 finally:
-    canable.close()
+    canable_sdk.close()
 ```
 
 | 函数 | 含义 |
@@ -39,7 +39,7 @@ finally:
 | `recv(timeout=0.1)` | 取下一帧，超时返回 None |
 | `close()` | 停止适配器并释放资源，可重复调用 |
 
-基础函数的现有参数与返回语义保持不变；`canable.__version__` 为包版本。经典 CAN 默认 1 Mbps；FD 模式默认 BRS，可显式关闭。ID、长度、能力和固件不满足时明确失败，显式序列号不匹配不会回退到其他设备。
+基础函数的现有参数与返回语义保持不变；`canable_sdk.__version__` 为包版本。经典 CAN 默认 1 Mbps；FD 模式默认 BRS，可显式关闭。ID、长度、能力和固件不满足时明确失败，显式序列号不匹配不会回退到其他设备。
 
 连接操作必须由调用 `open()` 的同一 Python 线程完成。多个电机可以共享这个通道，由上层唯一收发所有者按 CAN ID 和协议分发；不要让多个节点各自抢读同一个 `recv()`。当前模块级接口只管理一个适配器连接。
 
@@ -66,7 +66,7 @@ CAN 错误帧按 `is_error` 返回给上层；发送回显不冒充接收反馈�
 ## 可选 C++ 引擎
 
 ```python
-from canable.native import NativeBus
+from canable_sdk.native import NativeBus
 
 with NativeBus(serial_number="your-serial-number") as bus:
     bus.start_periodic(0x123, b"\x01\x02", rate=1000, seconds=10)
@@ -146,3 +146,6 @@ python demo.py --serial your-serial-number --id 0x123 --data 01020304 --rate 100
 按自己的总线协议选择 ID 和数据。示例只演示通信与统计，不实现电机协议，也不替代测试工程的公共记录器。
 
 本仓库的离线检查、构建与实机通信是不同证据。2026-11-02 在使用方 motor_test 中以序号 20923378374350012、固件 0x261001 的适配器完成两个节点的 SDO 与 FD+BRS MIT 收发，具体配置、原始帧和电机行为在使用方逐次记录；没有据此验证通用硬件回环、原生高频吞吐或其他固件／平台。
+# 2026-11-03 名称统一
+
+目录、安装项目、Python 导入与云仓库统一为 `canable_sdk`，公开仓库为 `https://github.com/llm-afk/canable_sdk`。版本仍为 0.2.0，接口／DLL／ABI 不变；旧 `import canable` 不提供别名。更名后 32 项离线检查与独立新 wheel 的 32 项隔离检查通过，主工程调用方一并更新。历史数据和本机备份保留。

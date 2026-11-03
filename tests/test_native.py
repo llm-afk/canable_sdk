@@ -5,7 +5,7 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
-from canable import native
+from canable_sdk import native
 
 
 class NativeTests(unittest.TestCase):

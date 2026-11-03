@@ -6,9 +6,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-import canable
-from canable.frame import CanFrame
-from canable.transport import Canable, DLC_LENGTHS, UsbFrameError, bit_timing, decode_usb, encode_usb
+import canable_sdk
+from canable_sdk.frame import CanFrame
+from canable_sdk.transport import Canable, DLC_LENGTHS, UsbFrameError, bit_timing, decode_usb, encode_usb
 
 
 def received(frame):
@@ -17,13 +17,13 @@ def received(frame):
 
 class DiscoveryTests(unittest.TestCase):
     def test_native_discovery_retains_localized_failure(self):
-        with patch('canable.transport.discover',side_effect=OSError('无法访问设备注册信息')):
+        with patch('canable_sdk.transport.discover',side_effect=OSError('无法访问设备注册信息')):
             with self.assertRaisesRegex(OSError, '设备注册信息'):
                 Canable.detect()
 
     def test_native_discovery_forwards_timeout_and_cancellation(self):
         event=threading.Event()
-        with patch('canable.transport.discover',return_value=[]) as discover:
+        with patch('canable_sdk.transport.discover',return_value=[]) as discover:
             self.assertEqual(Canable.detect(timeout=2,cancel_event=event),[])
         discover.assert_called_once_with(timeout=2,cancel_event=event)
 
@@ -160,12 +160,12 @@ class ReceiveTests(unittest.TestCase):
 
 class ModuleApiTests(unittest.TestCase):
     def setUp(self):
-        self.saved = (canable._bus, canable._owner, canable._fd, canable._priority)
-        canable._bus = canable._owner = canable._priority = None
-        canable._fd = False
+        self.saved = (canable_sdk._bus, canable_sdk._owner, canable_sdk._fd, canable_sdk._priority)
+        canable_sdk._bus = canable_sdk._owner = canable_sdk._priority = None
+        canable_sdk._fd = False
 
     def tearDown(self):
-        canable._bus, canable._owner, canable._fd, canable._priority = self.saved
+        canable_sdk._bus, canable_sdk._owner, canable_sdk._fd, canable_sdk._priority = self.saved
 
     def fake(self):
         class Fake:
@@ -185,32 +185,32 @@ class ModuleApiTests(unittest.TestCase):
         return Fake
 
     def test_legacy_module_api_and_default_classic_mode(self):
-        with patch.object(canable, '_Canable', self.fake()):
-            info = canable.open(high_priority=False)
-            bus = canable._bus
+        with patch.object(canable_sdk, '_Canable', self.fake()):
+            info = canable_sdk.open(high_priority=False)
+            bus = canable_sdk._bus
             info['usb_io']['offline'] = False
             self.assertTrue(bus.info['usb_io']['offline'])
-            canable.send(1, b'a')
+            canable_sdk.send(1, b'a')
             self.assertFalse(bus.sent[0].is_fd)
-            canable.close()
-            canable.close()
+            canable_sdk.close()
+            canable_sdk.close()
             self.assertTrue(bus.closed)
 
     def test_cross_thread_call_rejected_before_io(self):
-        with patch.object(canable, '_Canable', self.fake()):
-            canable.open(high_priority=False)
+        with patch.object(canable_sdk, '_Canable', self.fake()):
+            canable_sdk.open(high_priority=False)
             errors = []
             def other_thread():
                 try:
-                    canable.send(1, b'a')
+                    canable_sdk.send(1, b'a')
                 except RuntimeError as error:
                     errors.append(str(error))
             thread = threading.Thread(target=other_thread)
             thread.start()
             thread.join()
             self.assertEqual(len(errors), 1)
-            self.assertFalse(canable._bus.sent)
-            canable.close()
+            self.assertFalse(canable_sdk._bus.sent)
+            canable_sdk.close()
 
     def test_priority_failure_does_not_publish_connection(self):
         created = []
@@ -219,11 +219,11 @@ class ModuleApiTests(unittest.TestCase):
             bus = fake()
             created.append(bus)
             return bus
-        with patch.object(canable, '_Canable', factory), patch.object(
-                canable, '_ThreadPriority', side_effect=OSError('offline failure')):
+        with patch.object(canable_sdk, '_Canable', factory), patch.object(
+                canable_sdk, '_ThreadPriority', side_effect=OSError('offline failure')):
             with self.assertRaises(OSError):
-                canable.open()
-        self.assertIsNone(canable._bus)
+                canable_sdk.open()
+        self.assertIsNone(canable_sdk._bus)
         self.assertTrue(created[0].closed)
 
 

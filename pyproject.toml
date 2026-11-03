@@ -3,7 +3,7 @@ requires = ["setuptools>=70.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "canable-sdk"
+name = "canable_sdk"
 version = "0.2.0"
 description = "Windows WinUSB transport for the verified single-channel Candlelight CANable firmware"
 readme = "README.md"
@@ -15,8 +15,8 @@ classifiers = [
 ]
 
 [tool.setuptools]
-packages = ["canable"]
+packages = ["canable_sdk"]
 include-package-data = false
 
 [tool.setuptools.package-data]
-canable = ["_native.dll"]
+canable_sdk = ["_native.dll"]

@@ -3,7 +3,7 @@ import argparse
 import json
 import time
 
-import canable
+import canable_sdk
 
 
 def main():
@@ -15,10 +15,10 @@ def main():
     parser.add_argument('--seconds', type=float, default=10)
     args = parser.parse_args()
     if args.can_id is None:
-        print(json.dumps(canable.detect(), indent=2))
+        print(json.dumps(canable_sdk.detect(), indent=2))
         return 0
 
-    from canable.native import NativeBus
+    from canable_sdk.native import NativeBus
     with NativeBus(args.serial) as bus:
         bus.start_periodic(args.can_id, bytes.fromhex(args.data), args.rate, args.seconds)
         last = 0
